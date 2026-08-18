@@ -13,8 +13,9 @@ env:
   VAR_PATH: .github/workflows/build_var.json
   SCONS_CACHE: ${{ github.workspace }}/.scons-cache/
   EM_VERSION: 4.0.11
-  GODOT_VERSION: 4.5
+  GODOT_VERSION: 4.7.1
   EXPORT_NAME: ./demo/
+  EXECUTABLE_BASE_NAME: "SQLite Demo"
 
 jobs:
   matrix:
@@ -22,9 +23,10 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix-json: ${{ steps.set-matrix.outputs.matrix }}
+      job-names-json: ${{ steps.set-matrix.outputs.job_names }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - id: set-matrix
         shell: pwsh
         # Use a small PowerShell script to generate the build matrix
@@ -41,7 +43,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           lfs: true
           submodules: recursive
@@ -54,7 +56,7 @@ jobs:
 
       # Use python 3.x release (works cross platform; best to keep self contained in it's own step)
       - name: Set up Python 3.x
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           # Semantic version range syntax or exact version of a Python version
           python-version: "3.x"
@@ -68,7 +70,7 @@ jobs:
 
       - name: Web dependencies
         if: ${{ matrix.platform == 'web' }}
-        uses: mymindstorm/setup-emsdk@v14
+        uses: emscripten-core/setup-emsdk@v16
         with:
           version: ${{ env.EM_VERSION }}
           no-cache: true
@@ -117,11 +119,112 @@ jobs:
       - name: Upload Artifact
         env:
           ARTIFACT_FOLDER: ${{ env.PROJECT_FOLDER }}/${{ env.TARGET_PATH }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.cache-name }}-${{ matrix.target }}
           path: ${{ env.ARTIFACT_FOLDER }}*.${{ matrix.artifact-extension }}
           if-no-files-found: error
+
+  export-matrix:
+    name: Generate export matrix
+    runs-on: ubuntu-latest
+    needs: [ matrix, build ]
+    outputs:
+      matrix-json: ${{ steps.set-matrix.outputs.matrix }}
+
+    steps:
+      - uses: actions/checkout@v5
+      - id: set-matrix
+        env:
+          JOB_NAMES_JSON: ${{ needs.matrix.outputs.job-names-json }}
+        shell: pwsh
+        # Use a small PowerShell script to generate the export matrix
+        run: |
+          $array = @($env:JOB_NAMES_JSON | ConvertFrom-Json)
+          & .github/workflows/create-export-matrix.ps1 -JobNames $array
+
+  export:
+    name: Export - ${{ matrix.export_preset }}
+    runs-on: "ubuntu-22.04"
+    needs: [ export-matrix ]
+    container:
+      image: barichello/godot-ci:4.7.1 # Ideally this would be ${GODOT_VERSION}, but Github Actions doesn't allow this! :(
+    env:
+      BUILD_DIR: "build/${{ matrix.artifact_name }}"
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.export-matrix.outputs.matrix-json) }}
+
+    steps:
+      - name: Install fontconfig
+        run: apt-get update && apt-get install -y libfontconfig1
+
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          lfs: true
+          submodules: recursive
+
+      - name: Download Artifacts
+        id: download
+        uses: actions/download-artifact@v7
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Copy binaries to bin/-folder
+        run: |
+          ls ${{steps.download.outputs.download-path}}/
+          cd ${{ env.PROJECT_FOLDER }}/demo/addons/godot-sqlite/
+          cp -r ${{steps.download.outputs.download-path}}/* bin/
+          ls bin/
+
+      - name: Setup
+        run: |
+          mkdir -v -p ~/.local/share/godot/export_templates/
+          mv /root/.local/share/godot/export_templates/${GODOT_VERSION}.stable ~/.local/share/godot/export_templates/${GODOT_VERSION}.stable
+
+      # Initial editor load returns a segmentation fault due to race condition in doc unintialization -> Known issue! (#2024)
+      - name: Export
+        env:
+          EXECUTABLE_FILE_NAME: "${{ env.EXECUTABLE_BASE_NAME }}.${{ matrix.export_extension }}"
+        run: |
+          mkdir -v -p ${{ env.BUILD_DIR }}
+          EXPORT_DIR="$(readlink -f ${{ env.BUILD_DIR }})"
+          cd ${{ env.PROJECT_FOLDER }}/demo/
+          godot -e --headless --verbose --quit || true
+          godot --headless --verbose --export-release "${{ matrix.export_preset }}" "$EXPORT_DIR/$EXECUTABLE_FILE_NAME"
+          cp -a data/. "$EXPORT_DIR/data/"
+          ls "$EXPORT_DIR/data/"
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ env.BUILD_DIR }}
+
+  run:
+    name: Run - ${{ matrix.export_preset }}
+    runs-on: ${{ matrix.os }}
+    needs: [ export-matrix, export ]
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.export-matrix.outputs.matrix-json) }}
+
+    steps:
+      - name: Download Artifacts
+        id: download
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ matrix.artifact_name }}
+
+      - name: Run
+        shell: bash
+        env:
+          EXECUTABLE_FILE_NAME: "${{ env.EXECUTABLE_BASE_NAME }}.${{ matrix.export_extension }}"
+        run: "${{ join(matrix.run_cmd, '\n') }}"
 
   web-deploy:
     name: Web Deploy
@@ -129,11 +232,11 @@ jobs:
     needs: [build]
     if: github.ref == 'refs/heads/master'
     container:
-      image: barichello/godot-ci:4.5 # Ideally this would be ${GODOT_VERSION}, but Github Actions doesn't allow this! :(
+      image: barichello/godot-ci:4.7.1 # Ideally this would be ${GODOT_VERSION}, but Github Actions doesn't allow this! :(
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           lfs: true
 
@@ -181,7 +284,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           lfs: true
           submodules: recursive
@@ -197,9 +300,10 @@ jobs:
           mkdir -v -p ${{ env.PROJECT_FOLDER }}/${{ env.TARGET_PATH }}
           cd ${{ env.PROJECT_FOLDER }}
           cp -r ${{steps.download.outputs.download-path}}/**/* ${{ env.TARGET_PATH }}
+          cp LICENSE.md ${{ env.TARGET_PATH }}/..
           zip -r demo.zip demo/
-          cd ${{ env.TARGET_PATH }}/..
-          zip -r bin.zip bin/
+          cd demo
+          zip -r addons.zip addons/
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
@@ -207,6 +311,6 @@ jobs:
           body_path: ${{ env.PROJECT_FOLDER }}/.github/workflows/release_template.md
           files: |
             ${{ env.PROJECT_FOLDER }}/demo.zip
-            ${{ env.PROJECT_FOLDER }}/${{ env.TARGET_PATH }}/../bin.zip
+            ${{ env.PROJECT_FOLDER }}/demo/addons.zip
           draft: true
           prerelease: true

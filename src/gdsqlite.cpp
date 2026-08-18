@@ -36,6 +36,8 @@ void SQLite::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("enable_load_extension", "onoff"), &SQLite::enable_load_extension);
 	ClassDB::bind_method(D_METHOD("load_extension", "extension_path", "entrypoint"), &SQLite::load_extension, DEFVAL("sqlite3_extension_init"));
 
+	ClassDB::bind_static_method("SQLite", D_METHOD("sanitize_identifier", "table_or_column_name"), &SQLite::sanitize_identifier);
+
 	// Properties.
 	ClassDB::bind_method(D_METHOD("set_last_insert_rowid", "last_insert_rowid"), &SQLite::set_last_insert_rowid);
 	ClassDB::bind_method(D_METHOD("get_last_insert_rowid"), &SQLite::get_last_insert_rowid);
@@ -111,6 +113,26 @@ void SQLite::_bind_methods() {
 	BIND_CONSTANT(SQLITE_ROW);
 	BIND_CONSTANT(SQLITE_DONE);
 	/* end-of-error-codes */
+
+	// Signals.
+	ADD_SIGNAL(MethodInfo("row_inserted", PropertyInfo(Variant::STRING, "table_name"), PropertyInfo(Variant::INT, "rowid")));
+	ADD_SIGNAL(MethodInfo("row_updated", PropertyInfo(Variant::STRING, "table_name"), PropertyInfo(Variant::INT, "rowid")));
+	ADD_SIGNAL(MethodInfo("row_deleted", PropertyInfo(Variant::STRING, "table_name"), PropertyInfo(Variant::INT, "rowid")));
+}
+
+void update_hook_callback(void* db_ref, int notif_type, char const* db_name, char const* table_name, sqlite3_int64 row_id) {
+	SQLite *sqlite = (SQLite *)db_ref;
+	switch (notif_type) {
+		case SQLITE_INSERT:
+			sqlite->emit_signal("row_inserted", String(table_name), static_cast<int64_t>(row_id));
+			break;
+		case SQLITE_UPDATE:
+			sqlite->emit_signal("row_updated", String(table_name), static_cast<int64_t>(row_id));
+			break;
+		case SQLITE_DELETE:
+			sqlite->emit_signal("row_deleted", String(table_name), static_cast<int64_t>(row_id));
+			break;
+	}
 }
 
 SQLite::SQLite() {
@@ -182,6 +204,9 @@ bool SQLite::open_db() {
 		}
 	}
 
+	/* Connect data change notification callbacks to signals. */
+	sqlite3_update_hook(db, update_hook_callback, this);
+
 	return true;
 }
 
@@ -230,8 +255,7 @@ bool SQLite::prepare_statement(const CharString &p_query, sqlite3_stmt **out_stm
     query_result.clear();
 
     int rc = sqlite3_prepare_v2(db, sql, -1, out_stmt, pzTail);
-    const char *zErrMsg = sqlite3_errmsg(db);
-    error_message = String::utf8(zErrMsg);
+    update_error_message(rc);
 
     if (rc != SQLITE_OK) {
         ERR_PRINT(" --> SQL error: " + error_message);
@@ -347,8 +371,7 @@ bool SQLite::execute_statement(sqlite3_stmt *stmt) {
 	sqlite3_finalize(stmt);
 
 	int rc = sqlite3_errcode(db);
-	const char *zErrMsg = sqlite3_errmsg(db);
-	error_message = String::utf8(zErrMsg);
+	update_error_message(rc);
 	if (rc != SQLITE_OK) {
 		ERR_PRINT(" --> SQL error: " + error_message);
 		return false;
@@ -456,6 +479,10 @@ bool SQLite::query_with_named_bindings(const String &p_query, Dictionary param_b
 	return true;
 }
 
+String SQLite::sanitize_identifier(const String &p_identifier) {
+	return vformat("\"%s\"", p_identifier.replace("\"", "\"\""));
+}
+
 bool SQLite::create_table(const String &p_name, const Dictionary &p_table_dict) {
 	if (!validate_table_dict(p_table_dict)) {
 		return false;
@@ -464,7 +491,7 @@ bool SQLite::create_table(const String &p_name, const Dictionary &p_table_dict) 
 	String query_string, type_string, key_string, primary_string;
 	String integer_datatype = "int";
 	/* Create SQL statement */
-	query_string = "CREATE TABLE IF NOT EXISTS " + p_name + " (";
+	query_string = vformat("CREATE TABLE IF NOT EXISTS %s (", p_name);
 	key_string = "";
 	primary_string = "";
 
@@ -480,7 +507,7 @@ bool SQLite::create_table(const String &p_name, const Dictionary &p_table_dict) 
 	}
 	for (int64_t i = 0; i <= number_of_columns - 1; i++) {
 		column_dict = p_table_dict[columns[i]];
-		query_string += (const String &)columns[i] + String(" ");
+		query_string += vformat("%s ", (const String &)columns[i]);
 		type_string = (const String &)column_dict["data_type"];
 		if (type_string.to_lower().begins_with(integer_datatype)) {
 			query_string += String("INTEGER");
@@ -605,7 +632,7 @@ bool SQLite::validate_table_dict(const Dictionary &p_table_dict) {
 bool SQLite::drop_table(const String &p_name) {
 	String query_string;
 	/* Create SQL statement */
-	query_string = "DROP TABLE " + p_name + ";";
+	query_string = vformat("DROP TABLE %s;", p_name);
 
 	return query(query_string);
 }
@@ -651,24 +678,22 @@ int SQLite::backup_database(sqlite3 *source_db, sqlite3 *destination_db) {
 }
 
 bool SQLite::insert_row(const String &p_name, const Dictionary &p_row_dict) {
-	String query_string, key_string, value_string = "";
 	Array keys = p_row_dict.keys();
 	Array param_bindings = p_row_dict.values();
 
-	/* Create SQL statement */
-	query_string = "INSERT INTO " + p_name;
-
 	int64_t number_of_keys = p_row_dict.size();
-	for (int64_t i = 0; i <= number_of_keys - 1; i++) {
-		key_string += (const String &)keys[i];
-		value_string += "?";
-		if (i != number_of_keys - 1) {
-			key_string += ",";
-			value_string += ",";
-		}
-	}
-	query_string += " (" + key_string + ") VALUES (" + value_string + ");";
+	PackedStringArray key_strings;
+	key_strings.resize(number_of_keys);
+	PackedStringArray value_strings;
+	value_strings.resize(number_of_keys);
+	value_strings.fill("?");
 
+	for (int i = 0; i < number_of_keys; ++i) {
+		key_strings[i] = (const String &)keys[i];
+    }
+
+	/* Create SQL statement */
+	String query_string = vformat("INSERT INTO %s (%s) VALUES (%s);", p_name, String(", ").join(key_strings), String(", ").join(value_strings));
 	return query_with_bindings(query_string, param_bindings);
 }
 
@@ -697,35 +722,37 @@ bool SQLite::insert_rows(const String &p_name, const Array &p_row_array) {
 }
 
 Array SQLite::select_rows(const String &p_name, const String &p_conditions, const Array &p_columns_array) {
-	String query_string;
-	/* Create SQL statement */
-	query_string = "SELECT ";
+	if (p_columns_array.is_empty()) {
+		ERR_PRINT("GDSQLite Error: The columns array cannot be empty (HINT: Use [\"*\"] to select all columns)");
+		return query_result;
+	}
 
 	int64_t number_of_columns = p_columns_array.size();
-	for (int64_t i = 0; i <= number_of_columns - 1; i++) {
+	PackedStringArray key_strings;
+	key_strings.resize(number_of_columns);
+
+	for (int64_t i = 0; i < number_of_columns; i++) {
 		if (p_columns_array[i].get_type() != Variant::STRING) {
 			ERR_PRINT("GDSQLite Error: All elements of the Array should be of type String");
 			return query_result;
 		}
-		query_string += (const String &)p_columns_array[i];
-
-		if (i != number_of_columns - 1) {
-			query_string += ", ";
-		}
+		key_strings[i] = (const String &)p_columns_array[i];
 	}
-	query_string += " FROM " + p_name;
-	if (!p_conditions.is_empty()) {
-		query_string += " WHERE " + p_conditions;
-	}
-	query_string += ";";
 
+	String query_string;
+	/* Create SQL statement */
+	if (p_conditions.is_empty()) {
+		query_string = vformat("SELECT %s FROM %s;", String(", ").join(key_strings), p_name);
+	}
+	else {
+		query_string = vformat("SELECT %s FROM %s WHERE %s;", String(", ").join(key_strings), p_name, p_conditions);
+	}
 	query(query_string);
 	/* Return the duplicated result */
 	return get_query_result();
 }
 
 bool SQLite::update_rows(const String &p_name, const String &p_conditions, const Dictionary &p_updated_row_dict) {
-	String query_string;
 	Array param_bindings;
 	bool success;
 
@@ -733,19 +760,23 @@ bool SQLite::update_rows(const String &p_name, const String &p_conditions, const
 	Array keys = p_updated_row_dict.keys();
 	Array values = p_updated_row_dict.values();
 
-	query("BEGIN TRANSACTION;");
-	/* Create SQL statement */
-	query_string += "UPDATE " + p_name + " SET ";
+	PackedStringArray key_strings;
+	key_strings.resize(number_of_keys);
 
-	for (int64_t i = 0; i <= number_of_keys - 1; i++) {
-		query_string += (const String &)keys[i] + String("=?");
+	for (int64_t i = 0; i < number_of_keys; i++) {
+		key_strings[i] = vformat("%s=?", (const String &)keys[i]);
 		param_bindings.append(values[i]);
-		if (i != number_of_keys - 1) {
-			query_string += ", ";
-		}
 	}
-	query_string += " WHERE " + p_conditions + ";";
 
+	String query_string;
+	/* Create SQL statement */
+	if (p_conditions.is_empty()) {
+		query_string = vformat("UPDATE %s SET %s;", p_name, String(", ").join(key_strings));
+	}
+	else {
+		query_string = vformat("UPDATE %s SET %s WHERE %s;", p_name, String(", ").join(key_strings), p_conditions);
+	}
+	query("BEGIN TRANSACTION;");
 	success = query_with_bindings(query_string, param_bindings);
 	/* Stop the error_message from being overwritten! */
 	String previous_error_message = error_message;
@@ -755,18 +786,18 @@ bool SQLite::update_rows(const String &p_name, const String &p_conditions, const
 }
 
 bool SQLite::delete_rows(const String &p_name, const String &p_conditions) {
-	String query_string;
 	bool success;
 
-	query("BEGIN TRANSACTION;");
+	String query_string;
 	/* Create SQL statement */
-	query_string = "DELETE FROM " + p_name;
 	/* If it's empty or * everything is to be deleted */
-	if (!p_conditions.is_empty() && (p_conditions != (const String &)"*")) {
-		query_string += " WHERE " + p_conditions;
+	if (p_conditions.is_empty() || p_conditions == (const String &)"*") {
+		query_string = vformat("DELETE FROM %s;", p_name);
 	}
-	query_string += ";";
-
+	else {
+		query_string = vformat("DELETE FROM %s WHERE %s;", p_name, p_conditions);
+	}
+	query("BEGIN TRANSACTION;");
 	success = query(query_string);
 	/* Stop the error_message from being overwritten! */
 	String previous_error_message = error_message;
@@ -986,7 +1017,7 @@ bool SQLite::import_from_buffer(PackedByteArray json_buffer) {
 
 	/* Find all tables that are present in this database */
 	/* We don't care about indexes or triggers here since they get dropped automatically when their table is dropped */
-	query(String("SELECT name,type FROM sqlite_master WHERE type = 'table';"));
+	query(String("SELECT name,type FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%';"));
 	TypedArray<Dictionary> old_table_array = query_result.duplicate(true);
 #ifdef SQLITE_ENABLE_FTS5
 	/* FTS5 creates a bunch of shadow tables that cannot be dropped manually! */
@@ -997,7 +1028,7 @@ bool SQLite::import_from_buffer(PackedByteArray json_buffer) {
 	/* Drop all old tables present in the database */
 	for (int64_t i = 0; i <= old_number_of_tables - 1; i++) {
 		Dictionary table_dict = old_table_array[i];
-		String table_name = table_dict["name"];
+		String table_name = sanitize_identifier(table_dict["name"]);
 
 		drop_table(table_name);
 	}
@@ -1042,7 +1073,8 @@ bool SQLite::import_from_buffer(PackedByteArray json_buffer) {
 				ERR_PRINT("GDSQLite Error: All elements of the Array should be of type Dictionary");
 				return false;
 			}
-			if (!insert_row(object.name, object.row_array[i])) {
+			String table_name = sanitize_identifier(object.name);
+			if (!insert_row(table_name, object.row_array[i])) {
 				/* Don't forget to close the transaction! */
 				/* Stop the error_message from being overwritten! */
 				String previous_error_message = error_message;
@@ -1058,7 +1090,7 @@ bool SQLite::import_from_buffer(PackedByteArray json_buffer) {
 
 PackedByteArray SQLite::export_to_buffer() {
 	/* Get all names and sql templates for all tables present in the database */
-	query(String("SELECT name,sql,type FROM sqlite_master;"));
+	query(String("SELECT type,name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%';"));
 	TypedArray<Dictionary> database_array = query_result.duplicate(true);
 #ifdef SQLITE_ENABLE_FTS5
 	/* FTS5 creates a bunch of shadow tables that should NOT be exported! */
@@ -1073,7 +1105,7 @@ PackedByteArray SQLite::export_to_buffer() {
 			String object_name = object_dict["name"];
 			String query_string;
 
-			query_string = "SELECT * FROM " + (const String &)object_name + ";";
+			query_string = vformat("SELECT * FROM %s;", sanitize_identifier((const String &)object_name));
 			query(query_string);
 
 			/* Encode all columns of type PoolByteArray to base64 */
@@ -1263,6 +1295,16 @@ void SQLite::set_path(const String &p_path) {
 
 String SQLite::get_path() const {
 	return path;
+}
+
+void SQLite::update_error_message(int rc) {
+	/* The 'sqlite3_errmsg()'-method returns a non-empty string when rc is equal to SQLITE_OK, SQLITE_ROW or SQLITE_DONE. */
+	/* However, setting the message to an empty string makes much more sense. */
+	if (rc == SQLITE_OK || rc == SQLITE_ROW || rc == SQLITE_DONE) {
+		error_message = "";
+	}
+	const char *zErrMsg = sqlite3_errmsg(db);
+	error_message = String::utf8(zErrMsg);
 }
 
 void SQLite::set_error_message(const String &p_error_message) {
