@@ -314,13 +314,25 @@ bool SQLite::execute_statement(sqlite3_stmt *stmt) {
 		sqlite3_free(expanded_sql);
 	}
 
-	/* Column names don't change for every row -> Cache them! */
+	/* Column names don't change for every row -> Cache them!
+	 * They also don't change between calls, but this loop ran on every call: each StringName costs
+	 * a UTF-8 decode, an allocation and a lookup in the global StringName table, so a wide query
+	 * paid that for every column every time. The cache is keyed on the column name rather than on
+	 * the statement or the SQL text: a schema has a bounded number of distinct column names, while
+	 * applications that build SQL by concatenating literals produce unboundedly many distinct
+	 * statements, which would make a text-keyed cache grow without limit.
+	 * Not synchronised: a single SQLite object is not safe for concurrent use anyway. */
+	static std::unordered_map<std::string, StringName> column_name_cache;
 	int argc = sqlite3_column_count(stmt);
 	Vector<StringName> column_names;
 	column_names.resize(argc);
 	for (int i = 0; i < argc; i++) {
 		const char *azColName = sqlite3_column_name(stmt, i);
-		column_names.write[i] = StringName(String::utf8(azColName));
+		auto it = column_name_cache.find(azColName);
+		if (it == column_name_cache.end()) {
+			it = column_name_cache.emplace(azColName, StringName(String::utf8(azColName))).first;
+		}
+		column_names.write[i] = it->second;
 	}
 
 	// Execute the statement and iterate over all the resulting rows.
@@ -1302,6 +1314,7 @@ void SQLite::update_error_message(int rc) {
 	/* However, setting the message to an empty string makes much more sense. */
 	if (rc == SQLITE_OK || rc == SQLITE_ROW || rc == SQLITE_DONE) {
 		error_message = "";
+		return;
 	}
 	const char *zErrMsg = sqlite3_errmsg(db);
 	error_message = String::utf8(zErrMsg);
@@ -1328,7 +1341,11 @@ void SQLite::set_query_result(const TypedArray<Dictionary> &p_query_result) {
 }
 
 TypedArray<Dictionary> SQLite::get_query_result() const {
-	return query_result.duplicate(true);
+	/* A shallow copy is enough. The next query() calls query_result.clear(), which empties this
+	 * object's Array but not the one returned here; the row Dictionaries are reference-counted and
+	 * the caller becomes their only holder. A deep copy re-allocated every row Dictionary and every
+	 * cell Variant on every single query, which dominates the cost of any large result set. */
+	return query_result.duplicate(false);
 }
 
 TypedArray<Dictionary> SQLite::get_query_result_by_reference() const {
